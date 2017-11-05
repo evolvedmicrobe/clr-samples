@@ -3,6 +3,8 @@
 
 #pragma once
 
+// See https://www.codeproject.com/Articles/453065/ILRewriting-for-beginners
+
 HRESULT RewriteIL(
     ICorProfilerInfo * pICorProfilerInfo,
     ICorProfilerFunctionControl * pICorProfilerFunctionControl,

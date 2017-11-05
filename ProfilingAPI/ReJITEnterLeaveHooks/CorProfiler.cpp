@@ -6,25 +6,164 @@
 #include "CComPtr.h"
 #include "ILRewriter.h"
 #include "profiler_pal.h"
-#include <string>
 
+#include <stack>
+#include <vector>
+#include <utility>
+#include <ctime>
+
+
+static CorProfiler* main_profiler = nullptr;
+
+// Holds functionId and inclusive time in seconds
+std::stack<std::pair<FunctionID, double>> call_stack;
+
+clock_t last_frame_change;
+
+static double getElapsedTime(clock_t begin) {
+  clock_t end = clock();
+  return double(end - begin) / CLOCKS_PER_SEC;
+}
+
+
+// FunctionId is a pointer to a MethodDesc per https://blogs.msdn.microsoft.com/davbr/2007/12/18/debugging-your-profiler-ii-sos-and-ids/
+// Described here: https://github.com/dotnet/coreclr/blob/master/Documentation/botr/method-descriptor.md
 static void STDMETHODCALLTYPE Enter(FunctionID functionId)
 {
-    printf("\r\nEnter %" UINT_PTR_FORMAT "", (UINT64)functionId);
+
+    if(!call_stack.empty()) {
+        // Pop off the last frame and increment it's time
+        call_stack.top().second += getElapsedTime(last_frame_change);
+    }
+
+    // Increment the call count
+    auto fi = main_profiler->function_map[functionId];
+    fi->IncrementCallCount();
+    
+    // Add this frame to the shadow stack
+    call_stack.push(std::make_pair(functionId, 0.0));
+
+    last_frame_change = clock();
+    //printf("\r\nEnter %s", main_profiler->function_map[functionId]->GetName().c_str());
+//    printf("\r\nEnter %" UINT_PTR_FORMAT "", (UINT64)functionId);
 }
 
 static void STDMETHODCALLTYPE Leave(FunctionID functionId)
 {
-    printf("\r\nLeave %" UINT_PTR_FORMAT "", (UINT64)functionId);
+    // Update the amount of inclusive time
+    if(!call_stack.empty()) {
+        auto last = call_stack.top();
+        double elapsed_time = getElapsedTime(last_frame_change) + last.second;
+        //std::cout << "Elapsed Seconds: " << elapsed_time << std::endl;
+        main_profiler->function_map[functionId]->AddInclusiveTime(elapsed_time);
+        call_stack.pop();
+    }
+    last_frame_change = clock();
+    //printf("\r\nLeave %" UINT_PTR_FORMAT "", (UINT64)functionId);
 }
 
-COR_SIGNATURE enterLeaveMethodSignature             [] = { IMAGE_CEE_CS_CALLCONV_STDCALL, 0x01, ELEMENT_TYPE_VOID, ELEMENT_TYPE_I };
+
+
+COR_SIGNATURE enterLeaveMethodSignature  [] = { IMAGE_CEE_CS_CALLCONV_STDCALL, 0x01, ELEMENT_TYPE_VOID, ELEMENT_TYPE_I };
 
 void(STDMETHODCALLTYPE *EnterMethodAddress)(FunctionID) = &Enter;
 void(STDMETHODCALLTYPE *LeaveMethodAddress)(FunctionID) = &Leave;
 
+
+
+std::string ConvertString(WCHAR* wstr) { //WHCAR is char16_t
+    std::u16string source(wstr);
+    std::wstring_convert<std::codecvt_utf8_utf16<char16_t>,char16_t> convert; 
+    std::string str = convert.to_bytes(source);
+    return str;
+}
+
+
+FunctionInfo::FunctionInfo(FunctionID functionID, std::string name) :
+    m_functionID(functionID),
+    m_name(name),
+    m_callCount(0),
+    m_inclusiveSeconds(0.0)
+{
+}
+
+
+std::string FunctionInfo::GetName()
+{
+    return m_name;
+}
+
+FunctionID FunctionInfo::GetFunctionID()
+{
+    return m_functionID;
+}
+
+long FunctionInfo::GetCallCount()
+{
+    return m_callCount;
+}
+
+void FunctionInfo::IncrementCallCount()
+{
+    m_callCount++;
+}
+
+void FunctionInfo::AddInclusiveTime(double seconds) {
+    m_inclusiveSeconds += seconds;
+}
+
+double FunctionInfo::GetElapsedSeconds() {
+    return m_inclusiveSeconds;
+}
+
+std::string CorProfiler::GetFullMethodName(FunctionID functionID)//, LPWSTR wszMethod, int cMethod)
+{
+    std::cout << "Getting Name" << std::endl;
+   size_t NAME_BUFFER_SIZE = 2048;
+   std::string name;
+
+    IMetaDataImport* pIMetaDataImport = 0;
+    HRESULT hr = S_OK;
+    mdToken funcToken = 0;
+    WCHAR szFunction[NAME_BUFFER_SIZE];
+    WCHAR szClass[NAME_BUFFER_SIZE];
+    WCHAR szMethodName[NAME_BUFFER_SIZE];
+
+    // get the token for the function which we will use to get its name
+    hr = this->corProfilerInfo->GetTokenAndMetaDataFromFunction(functionID, IID_IMetaDataImport, (LPUNKNOWN *) &pIMetaDataImport, &funcToken);
+    if(SUCCEEDED(hr))
+    {
+        mdTypeDef classTypeDef;
+        ULONG cchFunction;
+        ULONG cchClass;
+
+        // retrieve the function properties based on the token
+        hr = pIMetaDataImport->GetMethodProps(funcToken, &classTypeDef, szFunction, NAME_BUFFER_SIZE, &cchFunction, 0, 0, 0, 0, 0);
+        if (SUCCEEDED(hr))
+        {
+            // get the function name
+            hr = pIMetaDataImport->GetTypeDefProps(classTypeDef, szClass, NAME_BUFFER_SIZE, &cchClass, 0, 0);
+            if (SUCCEEDED(hr))
+            {
+                // create the fully qualified name
+                name = ConvertString(szClass) + "." + ConvertString(szFunction);
+                // _snwprintf_s(szMethod,cMethod,cMethod,L"%s.%s",szClass,szFunction);
+            }
+        }
+        // release our reference to the metadata
+        pIMetaDataImport->Release();
+        std::cout << name << std::endl;
+        std::cout << "Finished" << std::endl;
+    }
+
+    return name;
+}
+
+
+
 CorProfiler::CorProfiler() : refCount(0), corProfilerInfo(nullptr)
 {
+
 }
 
 CorProfiler::~CorProfiler()
@@ -38,6 +177,7 @@ CorProfiler::~CorProfiler()
 
 HRESULT STDMETHODCALLTYPE CorProfiler::Initialize(IUnknown *pICorProfilerInfoUnk)
 {
+    main_profiler = this;
     HRESULT queryInterfaceResult = pICorProfilerInfoUnk->QueryInterface(__uuidof(ICorProfilerInfo8), reinterpret_cast<void **>(&this->corProfilerInfo));
 
     if (FAILED(queryInterfaceResult))
@@ -46,8 +186,8 @@ HRESULT STDMETHODCALLTYPE CorProfiler::Initialize(IUnknown *pICorProfilerInfoUnk
     }
 
     DWORD eventMask = COR_PRF_MONITOR_JIT_COMPILATION                      |
-                      COR_PRF_DISABLE_TRANSPARENCY_CHECKS_UNDER_FULL_TRUST | /* helps the case where this profiler is used on Full CLR */
-                      COR_PRF_DISABLE_INLINING                             ;
+                      COR_PRF_DISABLE_TRANSPARENCY_CHECKS_UNDER_FULL_TRUST ; /* helps the case where this profiler is used on Full CLR */
+                      //COR_PRF_DISABLE_INLINING                             ;
 
     auto hr = this->corProfilerInfo->SetEventMask(eventMask);
 
@@ -56,10 +196,34 @@ HRESULT STDMETHODCALLTYPE CorProfiler::Initialize(IUnknown *pICorProfilerInfoUnk
 
 HRESULT STDMETHODCALLTYPE CorProfiler::Shutdown()
 {
+    std::cout << "Shutdown!" << std::endl;
     if (this->corProfilerInfo != nullptr)
     {
         this->corProfilerInfo->Release();
         this->corProfilerInfo = nullptr;
+    }
+        std::cout << "Released!" << std::endl;
+
+
+    // Now let's go through and log the biggest methods
+    std::vector<std::shared_ptr<FunctionInfo>> timings;
+    for(auto it : function_map) {
+        timings.push_back(it.second);
+    }
+
+        std::cout << "Made" << std::endl;
+
+    std::sort(timings.begin(), timings.end(), [](std::shared_ptr<FunctionInfo> a,
+                                                 std::shared_ptr<FunctionInfo> b) {
+                                                    return a->GetElapsedSeconds() > b->GetElapsedSeconds(); 
+                                                 });
+
+
+      std::cout << "Sorted!" << std::endl;
+
+    for(int i =0; i< 20; i++) {
+        auto val = timings.at(i);
+        std::cout << val->GetName() << "\t" << val->GetElapsedSeconds() << "\t" << val->GetCallCount() << std::endl;;
     }
 
     return S_OK;
@@ -158,7 +322,7 @@ HRESULT STDMETHODCALLTYPE CorProfiler::FunctionUnloadStarted(FunctionID function
 HRESULT STDMETHODCALLTYPE CorProfiler::JITCompilationStarted(FunctionID functionId, BOOL fIsSafeToBlock)
 {
     HRESULT hr;
-    mdToken token;
+    mdToken token; // metadata token?
     ClassID classId;
     ModuleID moduleId;
 
@@ -173,6 +337,9 @@ HRESULT STDMETHODCALLTYPE CorProfiler::JITCompilationStarted(FunctionID function
     mdSignature enterLeaveMethodSignatureToken;
     metadataEmit->GetTokenFromSig(enterLeaveMethodSignature, sizeof(enterLeaveMethodSignature), &enterLeaveMethodSignatureToken);
 
+    std::string name = this->GetFullMethodName(functionId);
+    std::shared_ptr<FunctionInfo> fi (new FunctionInfo(functionId, name));
+    this->function_map[functionId] = fi;
     return RewriteIL(this->corProfilerInfo, nullptr, moduleId, token, functionId, reinterpret_cast<ULONGLONG>(EnterMethodAddress), reinterpret_cast<ULONGLONG>(LeaveMethodAddress), enterLeaveMethodSignatureToken);
 }
 

@@ -4,8 +4,34 @@
 #pragma once
 
 #include <atomic>
+#include <codecvt>
+#include <iostream>
+#include <map>
+#include <string>
+
 #include "cor.h"
 #include "corprof.h"
+
+
+class FunctionInfo
+{
+public:
+    FunctionInfo(FunctionID functionID, std::string name);
+
+    std::string GetName();
+    FunctionID GetFunctionID();
+    long GetCallCount();
+    void IncrementCallCount();
+    void AddInclusiveTime(double seconds);
+    double GetElapsedSeconds();
+private:
+    FunctionID m_functionID;
+    std::string m_name;
+    long m_callCount;
+    double m_inclusiveSeconds;
+
+};
+
 
 class CorProfiler : public ICorProfilerCallback8
 {
@@ -14,7 +40,10 @@ private:
     ICorProfilerInfo8* corProfilerInfo;
 public:
     CorProfiler();
+    std::map<FunctionID, std::shared_ptr<FunctionInfo>> function_map;
+
     virtual ~CorProfiler();
+    std::string GetFullMethodName(FunctionID functionID);//, LPWSTR wszMethod, int cMethod);
     HRESULT STDMETHODCALLTYPE Initialize(IUnknown* pICorProfilerInfoUnk) override;
     HRESULT STDMETHODCALLTYPE Shutdown() override;
     HRESULT STDMETHODCALLTYPE AppDomainCreationStarted(AppDomainID appDomainId) override;
